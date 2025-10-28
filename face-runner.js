@@ -1,5 +1,15 @@
 // face-runner.js
 // Unity WebGL 얼굴 중심 추적 (안정 버전)
+navigator.mediaDevices
+    .getUserMedia({ video: true })
+    .then((stream) => {
+        console.log("✅ Camera stream OK:", stream);
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.autoplay = true;
+        document.body.appendChild(video);
+    })
+    .catch((err) => console.error("❌ Camera error:", err));
 
 window.__FaceTracker = {
     start: async function (
