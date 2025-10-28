@@ -1,34 +1,41 @@
-// face-runner.js
-// Unity WebGL 얼굴 중심 추적 (안정 버전)
-navigator.mediaDevices
-    .getUserMedia({ video: true })
-    .then((stream) => {
-        console.log("✅ Camera stream OK:", stream);
-        const video = document.createElement("video");
-        video.srcObject = stream;
-        video.autoplay = true;
-        document.body.appendChild(video);
-    })
-    .catch((err) => console.error("❌ Camera error:", err));
+// face-runner.js (ESM)
+// MediaPipe FaceLandmarker를 CPU 모드로 돌리고,
+// 얼굴 중심 이동값을 Unity로 전달(unityInstance.SendMessage)
 
 window.__FaceTracker = {
-    start: async function (
+    _state: {
+        stream: null,
+        rafId: 0,
+        landmarker: null,
+        video: null,
+    },
+
+    async start(
         gameObjectName = "FaceReceiver",
         methodName = "OnFaceMove",
         sensitivity = 1.5
     ) {
-        console.log("🎥 FaceTracker initializing...");
+        console.log("🎥 FaceTracker: init");
 
-        // ✅ HTTPS 확인 (모바일에서 필수)
+        // HTTPS 권장 (localhost 예외)
         if (
             location.protocol !== "https:" &&
             location.hostname !== "localhost"
         ) {
-            alert("⚠️ 카메라 사용을 위해 HTTPS 연결이 필요합니다.");
-            return;
+            console.warn("FaceTracker: HTTPS 권장 (카메라 권한 문제 가능)");
         }
 
-        // ✅ 카메라 접근
+        // 1) 비디오 생성
+        const video = document.createElement("video");
+        Object.assign(video, {
+            autoplay: true,
+            playsInline: true,
+            muted: true,
+        });
+        video.style.display = "none";
+        document.body.appendChild(video);
+
+        // 2) 카메라 접근
         let stream;
         try {
             stream = await navigator.mediaDevices.getUserMedia({
@@ -39,115 +46,145 @@ window.__FaceTracker = {
                 },
                 audio: false,
             });
-        } catch (err) {
-            console.error("❌ getUserMedia 실패:", err);
+        } catch (e) {
+            console.error("getUserMedia failed:", e);
             alert("카메라 권한을 허용해주세요.");
             return;
         }
-
-        // ✅ 비디오 엘리먼트 생성
-        const video = document.createElement("video");
-        video.autoplay = true;
-        video.playsInline = true;
-        video.muted = true;
-        video.style.display = "none";
         video.srcObject = stream;
-        document.body.appendChild(video);
+        await new Promise((r) => (video.onloadedmetadata = r));
 
-        await new Promise((res) => (video.onloadedmetadata = res));
-        console.log(
-            "📸 Video stream ready:",
-            video.videoWidth,
-            "x",
-            video.videoHeight
-        );
-
-        // ✅ 캔버스 설정 (입력 다운샘플)
-        const maxSize = 320;
-        const scale = maxSize / Math.max(video.videoWidth, video.videoHeight);
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.round(video.videoWidth * scale);
-        canvas.height = Math.round(video.videoHeight * scale);
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-        // ✅ MediaPipe FaceLandmarker 로드
+        // 3) MediaPipe 로드 (CPU delegate로 WebGL 충돌 회피)
         const { FaceLandmarker, FilesetResolver } = await import(
-            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7"
         );
         const resolver = await FilesetResolver.forVisionTasks(
-            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.7/wasm"
         );
         const landmarker = await FaceLandmarker.createFromOptions(resolver, {
             baseOptions: {
+                delegate: "CPU", // ⭐️ Unity WebGL과 충돌 방지 핵심
                 modelAssetPath:
                     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
             },
             runningMode: "VIDEO",
             numFaces: 1,
+            minFaceDetectionConfidence: 0.2,
+            minFacePresenceConfidence: 0.2,
+            minTrackingConfidence: 0.2,
         });
-        console.log("✅ FaceLandmarker loaded.");
 
-        // ✅ 안전한 SendMessage 헬퍼
-        function safeSend(obj, method, payload, retries = 30) {
-            const send =
-                window.SendMessage || window.unityInstance?.SendMessage;
-            if (typeof send === "function") {
-                send(obj, method, payload);
-            } else if (retries > 0) {
-                setTimeout(
-                    () => safeSend(obj, method, payload, retries - 1),
-                    200
-                );
-            } else {
-                console.warn("⚠️ Unity SendMessage not ready.");
-            }
-        }
+        console.log("✅ FaceTracker: model ready");
 
-        // ✅ 중심 계산 변수
+        // 내부 상태 저장
+        this._state.stream = stream;
+        this._state.landmarker = landmarker;
+        this._state.video = video;
+
+        // 4) 루프
         let prevX = 0.5,
             prevY = 0.5;
 
-        async function loop(t) {
-            // 비디오 준비 체크
+        const loop = async () => {
             if (video.readyState < 2) {
                 requestAnimationFrame(loop);
                 return;
             }
 
-            // 좌우반전 (전면 카메라용)
-            ctx.save();
-            ctx.scale(-1, 1);
-            ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-            ctx.restore();
+            // ⬇️ 추가 부분
+            if (video.paused) {
+                console.warn(
+                    "⚠️ Video is paused — trying to resume playback..."
+                );
+                try {
+                    await video.play();
+                    console.log("▶️ Video playback resumed");
+                } catch (e) {
+                    console.error("❌ Failed to resume video:", e);
+                }
+                requestAnimationFrame(loop);
+                return;
+            }
 
-            const res = await landmarker.detectForVideo(
-                canvas,
-                t || performance.now()
-            );
+            // 안정적인 타임스탬프
+            const now = performance.now();
+            let res;
+            try {
+                res = await landmarker.detectForVideo(video, now);
+            } catch (e) {
+                // 탭 전환/일시적 이슈 등
+                // console.warn("detectForVideo error:", e);
+                this._state.rafId = requestAnimationFrame(loop);
+                return;
+            }
 
             if (res && res.faceLandmarks && res.faceLandmarks.length > 0) {
+                // console.log("✅ Face detected!");
+
                 const lm = res.faceLandmarks[0];
                 const cx = lm.reduce((s, p) => s + p.x, 0) / lm.length;
                 const cy = lm.reduce((s, p) => s + p.y, 0) / lm.length;
 
+                // 중앙(0.5,0.5) 기준 상대이동 (+감도)
                 const dx = (cx - 0.5) * sensitivity;
                 const dy = (cy - 0.5) * sensitivity;
 
+                // 소진동 필터
                 if (
                     Math.abs(dx - prevX) > 0.01 ||
                     Math.abs(dy - prevY) > 0.01
                 ) {
                     prevX = dx;
                     prevY = dy;
-                    const payload = JSON.stringify({ x: dx, y: dy });
-                    safeSend(gameObjectName, methodName, payload);
+
+                    // Unity로 전송
+                    const send = window.unityInstance?.SendMessage;
+                    if (typeof send === "function") {
+                        send(
+                            gameObjectName,
+                            methodName,
+                            JSON.stringify({ x: dx, y: dy })
+                        );
+                    }
                 }
             }
 
-            requestAnimationFrame(loop);
-        }
+            this._state.rafId = requestAnimationFrame(loop);
+        };
 
-        console.log("🚀 FaceTracker started.");
-        requestAnimationFrame(loop);
+        // 탭 비활성화 후 복귀 시 루프 재개
+        document.addEventListener("visibilitychange", () => {
+            if (
+                !document.hidden &&
+                this._state.landmarker &&
+                !this._state.rafId
+            ) {
+                this._state.rafId = requestAnimationFrame(loop);
+            }
+        });
+
+        // 시작
+        this._state.rafId = requestAnimationFrame(loop);
+    },
+
+    stop() {
+        try {
+            if (this._state.rafId) cancelAnimationFrame(this._state.rafId);
+            this._state.rafId = 0;
+            this._state.landmarker?.close?.();
+            this._state.landmarker = null;
+            if (this._state.stream) {
+                this._state.stream.getTracks().forEach((t) => t.stop());
+                this._state.stream = null;
+            }
+            if (this._state.video) {
+                this._state.video.srcObject = null;
+                this._state.video.remove();
+                this._state.video = null;
+            }
+            console.log("🛑 FaceTracker stopped");
+        } catch (e) {
+            console.warn("FaceTracker.stop error:", e);
+        }
     },
 };
